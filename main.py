@@ -3,7 +3,6 @@ import os
 import json
 import re
 import pytz
-import base64
 from datetime import datetime
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -12,22 +11,17 @@ from telegram.ext import (
 )
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
-import google.generativeai as genai
 
 # ==================== KONFIGURASI ====================
 BOT_TOKEN = os.environ.get("BOT_TOKEN_BELANJA")
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 SHEET_NAME = "Pengeluaran"
 WIB = pytz.timezone("Asia/Jakarta")
-
-genai.configure(api_key=GEMINI_API_KEY)
 
 logging.basicConfig(format="%(asctime)s - %(levelname)s - %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # ==================== STATE ====================
-TUNGGU_INPUT = 1
-KONFIRMASI = 2
+TOKO, ITEM, JUMLAH, HARGA_SATUAN, TAMBAH_ITEM, PEMBAYARAN, KONFIRMASI = range(7)
 
 # ==================== GOOGLE SHEETS ====================
 def get_sheet():
@@ -43,18 +37,17 @@ def get_sheet():
     try:
         sheet = spreadsheet.worksheet(SHEET_NAME)
     except gspread.WorksheetNotFound:
-        sheet = spreadsheet.add_worksheet(title=SHEET_NAME, rows=1000, cols=10)
-        sheet.append_row(["No", "Tanggal", "Waktu", "Nama Toko", "Item", "Harga Satuan", "Jumlah", "Subtotal", "Total Belanja", "Sumber"])
+        sheet = spreadsheet.add_worksheet(title=SHEET_NAME, rows=1000, cols=9)
+        sheet.append_row(["No", "Tanggal", "Waktu", "Nama Toko", "Item", "Jumlah", "Harga Satuan", "Subtotal", "Metode Bayar"])
     return sheet
 
 def simpan_ke_sheet(data: dict):
     sheet = get_sheet()
     now = datetime.now(WIB)
-    tanggal = data.get("tanggal", now.strftime("%d/%m/%Y"))
+    tanggal = now.strftime("%d/%m/%Y")
     waktu = now.strftime("%H:%M:%S")
     toko = data.get("toko", "-")
-    total = data.get("total", 0)
-    sumber = data.get("sumber", "manual")
+    pembayaran = data.get("pembayaran", "-")
     items = data.get("items", [])
     no_awal = len(sheet.get_all_values())
     for item in items:
@@ -64,11 +57,10 @@ def simpan_ke_sheet(data: dict):
             waktu,
             toko,
             item.get("nama", "-"),
-            item.get("harga_satuan", 0),
             item.get("jumlah", 1),
+            item.get("harga_satuan", 0),
             item.get("subtotal", 0),
-            total,
-            sumber,
+            pembayaran,
         ])
         no_awal += 1
 
@@ -78,110 +70,25 @@ def fmt(angka):
     except:
         return str(angka)
 
-# ==================== GEMINI ====================
-async def baca_struk_gemini(foto_bytes: bytes) -> dict:
-    model = genai.GenerativeModel("gemini-1.5-flash")
-    foto_b64 = base64.b64encode(foto_bytes).decode("utf-8")
-    prompt = """Kamu adalah asisten yang membaca struk belanja.
-Ekstrak informasi dari struk ini dan kembalikan HANYA dalam format JSON seperti ini:
-{
-  "toko": "nama toko",
-  "tanggal": "dd/mm/yyyy",
-  "items": [
-    {"nama": "nama item", "jumlah": 1, "harga_satuan": 10000, "subtotal": 10000}
-  ],
-  "total": 50000
-}
-Aturan:
-- Jika tanggal tidak ada, isi dengan "hari ini"
-- Jika nama toko tidak ada, isi dengan "Tidak diketahui"
-- jumlah dan harga dalam angka bulat tanpa Rp atau pemisah ribuan
-- Jika tidak bisa membaca struk, kembalikan {"error": "tidak bisa membaca struk"}
-- Kembalikan HANYA JSON, tanpa teks lain"""
-    response = model.generate_content([
-        {"mime_type": "image/jpeg", "data": foto_b64},
-        prompt
-    ])
-    text = response.text.strip()
-    text = re.sub(r"```json|```", "", text).strip()
-    return json.loads(text)
-
-# ==================== PARSE INPUT MANUAL ====================
-def parse_input_manual(teks: str) -> dict:
-    """
-    Format: Nama Toko | Item jumlah harga, Item jumlah harga
-    Contoh: Pasar Minggu | Tepung Terigu 2 15000, Gula Pasir 1 12000
-    """
-    try:
-        if "|" in teks:
-            bagian = teks.split("|", 1)
-            toko = bagian[0].strip()
-            item_str = bagian[1].strip()
-        else:
-            toko = "Tidak diketahui"
-            item_str = teks.strip()
-
-        items = []
-        total = 0
-        for item_raw in item_str.split(","):
-            item_raw = item_raw.strip()
-            if not item_raw:
-                continue
-            angka = re.findall(r'\d+', item_raw)
-            teks_nama = re.sub(r'\d+', '', item_raw).strip()
-
-            if len(angka) >= 2:
-                jumlah = int(angka[-2])
-                harga_satuan = int(angka[-1])
-                if jumlah > 100:
-                    jumlah = 1
-                    harga_satuan = int(angka[-1])
-            elif len(angka) == 1:
-                jumlah = 1
-                harga_satuan = int(angka[0])
-            else:
-                continue
-
-            subtotal = jumlah * harga_satuan
-            total += subtotal
-            items.append({
-                "nama": teks_nama if teks_nama else "Item",
-                "jumlah": jumlah,
-                "harga_satuan": harga_satuan,
-                "subtotal": subtotal,
-            })
-
-        now = datetime.now(WIB)
-        return {
-            "toko": toko,
-            "tanggal": now.strftime("%d/%m/%Y"),
-            "items": items,
-            "total": total,
-            "sumber": "manual",
-        }
-    except Exception as e:
-        logger.error(f"Error parse manual: {e}")
-        return None
-
 def format_ringkasan(data: dict) -> str:
     teks = f"📋 *Ringkasan Belanja*\n\n"
     teks += f"🏪 Toko: {data.get('toko', '-')}\n"
-    teks += f"📅 Tanggal: {data.get('tanggal', '-')}\n\n"
+    teks += f"💳 Pembayaran: {data.get('pembayaran', '-')}\n\n"
     teks += f"🛒 *Item:*\n"
+    total = 0
     for item in data.get("items", []):
+        subtotal = item.get("subtotal", 0)
+        total += subtotal
         teks += f"  • {item['nama']}\n"
-        teks += f"    {item['jumlah']} x Rp {fmt(item['harga_satuan'])} = Rp {fmt(item['subtotal'])}\n"
-    teks += f"\n💰 *Total: Rp {fmt(data.get('total', 0))}*"
+        teks += f"    {item['jumlah']} x Rp {fmt(item['harga_satuan'])} = Rp {fmt(subtotal)}\n"
+    teks += f"\n💰 *Total: Rp {fmt(total)}*"
     return teks
 
 # ==================== HANDLERS ====================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    keyboard = [
-        [InlineKeyboardButton("📸 Upload Struk", callback_data="struk")],
-        [InlineKeyboardButton("✏️ Input Manual", callback_data="manual")],
-    ]
+    keyboard = [[InlineKeyboardButton("✏️ Catat Pengeluaran", callback_data="catat")]]
     await update.message.reply_text(
-        "🧾 *Bot Pengeluaran Bahan Baku*\n\nHalo! Mau catat pengeluaran gimana?",
+        "🧾 *Bot Pengeluaran Bahan Baku*\n\nHalo! Siap mencatat pengeluaran belanja kamu.",
         reply_markup=InlineKeyboardMarkup(keyboard),
         parse_mode="Markdown"
     )
@@ -190,109 +97,115 @@ async def menu_utama(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     context.user_data.clear()
-    keyboard = [
-        [InlineKeyboardButton("📸 Upload Struk", callback_data="struk")],
-        [InlineKeyboardButton("✏️ Input Manual", callback_data="manual")],
-    ]
+    keyboard = [[InlineKeyboardButton("✏️ Catat Pengeluaran", callback_data="catat")]]
     await query.edit_message_text(
-        "🧾 *Bot Pengeluaran Bahan Baku*\n\nMau catat pengeluaran gimana?",
+        "🧾 *Bot Pengeluaran Bahan Baku*\n\nMau catat pengeluaran baru?",
         reply_markup=InlineKeyboardMarkup(keyboard),
         parse_mode="Markdown"
     )
 
-async def pilih_struk(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def catat(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    context.user_data["mode"] = "struk"
+    context.user_data.clear()
+    context.user_data["items"] = []
     await query.edit_message_text(
-        "📸 Silakan kirim *foto struk* belanja kamu.",
+        "🏪 Beli di mana?\n\nKetik nama toko/tempat belanja:"
+    )
+    return TOKO
+
+async def terima_toko(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["toko"] = update.message.text.strip()
+    await update.message.reply_text(
+        "🛒 Item apa yang dibeli?\n\nKetik nama item:"
+    )
+    return ITEM
+
+async def terima_item(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["item_sementara"] = {"nama": update.message.text.strip()}
+    await update.message.reply_text(
+        f"📦 Berapa jumlah *{context.user_data['item_sementara']['nama']}* yang dibeli?\n\nKetik angka:",
         parse_mode="Markdown"
     )
-    return TUNGGU_INPUT
+    return JUMLAH
 
-async def pilih_manual(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    context.user_data["mode"] = "manual"
-    await query.edit_message_text(
-        "✏️ Ketik pengeluaran dengan format:\n\n"
-        "*Nama Toko | Item jumlah harga, Item jumlah harga*\n\n"
-        "Contoh:\n"
-        "`Pasar Minggu | Tepung Terigu 2 15000, Gula Pasir 1 12000`\n\n"
-        "Tanpa jumlah (otomatis 1):\n"
-        "`Alfamart | Mentega 8500, Telur 10 25000`",
-        parse_mode="Markdown"
-    )
-    return TUNGGU_INPUT
-
-async def terima_foto(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("⏳ Sedang membaca struk, tunggu sebentar...")
+async def terima_jumlah(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
-        foto = update.message.photo[-1]
-        file = await foto.get_file()
-        foto_bytes = await file.download_as_bytearray()
-        data = await baca_struk_gemini(bytes(foto_bytes))
+        jumlah = int(update.message.text.strip())
+        if jumlah <= 0:
+            raise ValueError
+    except ValueError:
+        await update.message.reply_text("❌ Masukkan angka yang benar:")
+        return JUMLAH
+    context.user_data["item_sementara"]["jumlah"] = jumlah
+    await update.message.reply_text(
+        f"💰 Berapa harga satuan *{context.user_data['item_sementara']['nama']}*?\n\nKetik angka (tanpa Rp):",
+        parse_mode="Markdown"
+    )
+    return HARGA_SATUAN
 
-        if "error" in data:
-            keyboard = [
-                [InlineKeyboardButton("✏️ Input Manual", callback_data="manual")],
-                [InlineKeyboardButton("🏠 Menu Utama", callback_data="menu_utama")],
-            ]
-            await update.message.reply_text(
-                "❌ Tidak bisa membaca struk. Coba input manual.",
-                reply_markup=InlineKeyboardMarkup(keyboard)
-            )
-            return ConversationHandler.END
+async def terima_harga_satuan(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        harga = int(re.sub(r'[^\d]', '', update.message.text.strip()))
+        if harga <= 0:
+            raise ValueError
+    except ValueError:
+        await update.message.reply_text("❌ Masukkan angka yang benar:")
+        return HARGA_SATUAN
 
-        if data.get("tanggal") == "hari ini":
-            data["tanggal"] = datetime.now(WIB).strftime("%d/%m/%Y")
+    item = context.user_data["item_sementara"]
+    item["harga_satuan"] = harga
+    item["subtotal"] = item["jumlah"] * harga
+    context.user_data["items"].append(item)
+    context.user_data["item_sementara"] = {}
 
-        data["sumber"] = "struk"
-        context.user_data["data_belanja"] = data
+    keyboard = [
+        [InlineKeyboardButton("➕ Tambah Item Lagi", callback_data="tambah_item")],
+        [InlineKeyboardButton("✅ Selesai Input Item", callback_data="selesai_item")],
+    ]
+    await update.message.reply_text(
+        f"✅ *{item['nama']}* ditambahkan!\n"
+        f"   {item['jumlah']} x Rp {fmt(harga)} = Rp {fmt(item['subtotal'])}\n\n"
+        f"Masih ada item lain?",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode="Markdown"
+    )
+    return TAMBAH_ITEM
 
-        keyboard = [
-            [InlineKeyboardButton("✅ Simpan", callback_data="simpan")],
-            [InlineKeyboardButton("❌ Batal", callback_data="batal")],
-        ]
-        await update.message.reply_text(
-            format_ringkasan(data) + "\n\nData sudah benar?",
-            reply_markup=InlineKeyboardMarkup(keyboard),
-            parse_mode="Markdown"
-        )
-        return KONFIRMASI
+async def tambah_item_lagi(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    await query.edit_message_text(
+        "🛒 Item apa lagi yang dibeli?\n\nKetik nama item:"
+    )
+    return ITEM
 
-    except Exception as e:
-        logger.error(f"Error baca struk: {e}")
-        keyboard = [
-            [InlineKeyboardButton("✏️ Input Manual", callback_data="manual")],
-            [InlineKeyboardButton("🏠 Menu Utama", callback_data="menu_utama")],
-        ]
-        await update.message.reply_text(
-            f"❌ Gagal membaca struk.\n\nCoba input manual.",
-            reply_markup=InlineKeyboardMarkup(keyboard)
-        )
-        return ConversationHandler.END
+async def selesai_item(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    keyboard = [
+        [InlineKeyboardButton("💵 Cash", callback_data="cash")],
+        [InlineKeyboardButton("📱 QRIS", callback_data="qris")],
+        [InlineKeyboardButton("💳 Transfer", callback_data="transfer")],
+    ]
+    await query.edit_message_text(
+        "💳 Pembayaran pakai apa?",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+    return PEMBAYARAN
 
-async def terima_teks(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    teks = update.message.text.strip()
-    data = parse_input_manual(teks)
+async def terima_pembayaran(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    metode = {"cash": "Cash 💵", "qris": "QRIS 📱", "transfer": "Transfer 💳"}
+    context.user_data["pembayaran"] = metode[query.data]
 
-    if not data or not data.get("items"):
-        await update.message.reply_text(
-            "❌ Format tidak dikenali. Coba lagi:\n\n"
-            "`Nama Toko | Item jumlah harga, Item jumlah harga`\n\n"
-            "Contoh:\n`Pasar | Tepung 2 15000, Gula 1 12000`",
-            parse_mode="Markdown"
-        )
-        return TUNGGU_INPUT
-
-    context.user_data["data_belanja"] = data
     keyboard = [
         [InlineKeyboardButton("✅ Simpan", callback_data="simpan")],
         [InlineKeyboardButton("❌ Batal", callback_data="batal")],
     ]
-    await update.message.reply_text(
-        format_ringkasan(data) + "\n\nData sudah benar?",
+    await query.edit_message_text(
+        format_ringkasan(context.user_data) + "\n\nData sudah benar?",
         reply_markup=InlineKeyboardMarkup(keyboard),
         parse_mode="Markdown"
     )
@@ -301,15 +214,10 @@ async def terima_teks(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def simpan_data(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    data = context.user_data.get("data_belanja")
-    if not data:
-        await query.edit_message_text("❌ Data tidak ditemukan. Mulai ulang.")
-        return ConversationHandler.END
     try:
-        simpan_ke_sheet(data)
+        simpan_ke_sheet(context.user_data)
         keyboard = [
-            [InlineKeyboardButton("📸 Catat Lagi (Struk)", callback_data="struk")],
-            [InlineKeyboardButton("✏️ Catat Lagi (Manual)", callback_data="manual")],
+            [InlineKeyboardButton("✏️ Catat Lagi", callback_data="catat")],
             [InlineKeyboardButton("🏠 Menu Utama", callback_data="menu_utama")],
         ]
         await query.edit_message_text(
@@ -340,18 +248,18 @@ def main():
     app = Application.builder().token(BOT_TOKEN).build()
 
     conv_handler = ConversationHandler(
-        entry_points=[
-            CallbackQueryHandler(pilih_struk, pattern="^struk$"),
-            CallbackQueryHandler(pilih_manual, pattern="^manual$"),
-        ],
+        entry_points=[CallbackQueryHandler(catat, pattern="^catat$")],
         states={
-            TUNGGU_INPUT: [
-                MessageHandler(filters.PHOTO, terima_foto),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, terima_teks),
+            TOKO:        [MessageHandler(filters.TEXT & ~filters.COMMAND, terima_toko)],
+            ITEM:        [MessageHandler(filters.TEXT & ~filters.COMMAND, terima_item)],
+            JUMLAH:      [MessageHandler(filters.TEXT & ~filters.COMMAND, terima_jumlah)],
+            HARGA_SATUAN:[MessageHandler(filters.TEXT & ~filters.COMMAND, terima_harga_satuan)],
+            TAMBAH_ITEM: [
+                CallbackQueryHandler(tambah_item_lagi, pattern="^tambah_item$"),
+                CallbackQueryHandler(selesai_item, pattern="^selesai_item$"),
             ],
-            KONFIRMASI: [
-                CallbackQueryHandler(simpan_data, pattern="^simpan$"),
-            ],
+            PEMBAYARAN:  [CallbackQueryHandler(terima_pembayaran, pattern="^(cash|qris|transfer)$")],
+            KONFIRMASI:  [CallbackQueryHandler(simpan_data, pattern="^simpan$")],
         },
         fallbacks=[
             CallbackQueryHandler(batal, pattern="^batal$"),
